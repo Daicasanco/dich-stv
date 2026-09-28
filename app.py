@@ -29,19 +29,37 @@ tokenizer = AutoTokenizer.from_pretrained(str(model_path))
 translator = ctranslate2.Translator(str(model_path / "ct2-int8_float32"), device="cpu", compute_type="int8_float32")
 print("Mô hình đã sẵn sàng!")
 
+def clean_vietnamese(text: str) -> str:
+    # Thêm khoảng trắng sau dấu câu nếu thiếu
+    text = re.sub(r'([.!?])([A-ZÀ-Ỹ0-9])', r'\1 \2', text)
+    text = re.sub(r'([,;:])([a-zA-Zà-ỹÀ-Ỹ0-9])', r'\1 \2', text)
+    text = re.sub(r' +', ' ', text)
+    return text.strip()
+
 def translate_text(text: str) -> str:
     if not text or not text.strip():
         return ""
     
+    # Kiểm tra nếu không có tiếng Trung thì không dịch để tránh lỗi mô hình Marian
+    has_chinese = bool(re.search(r'[\u4e00-\u9fa5]', text))
+    if not has_chinese:
+        return text.strip()
+
     paragraphs = text.split("\n")
     results = []
     
     for para in paragraphs:
-        if not para.strip():
+        para_clean = para.strip()
+        if not para_clean:
             results.append("")
             continue
         
-        sentences = [s for s in re.split(r'([。！？\n])', para) if s]
+        # Nếu đoạn không có chữ Hán thì giữ nguyên
+        if not re.search(r'[\u4e00-\u9fa5]', para_clean):
+            results.append(para_clean)
+            continue
+        
+        sentences = [s for s in re.split(r'([。！？\n])', para_clean) if s]
         chunks = []
         cur = ""
         for s in sentences:
@@ -55,7 +73,7 @@ def translate_text(text: str) -> str:
         tokens = [tokenizer.convert_ids_to_tokens(tokenizer(c).input_ids) for c in chunks]
         res = translator.translate_batch(tokens, beam_size=1, max_decoding_length=256)
         out = "".join(tokenizer.decode(tokenizer.convert_tokens_to_ids(r.hypotheses[0]), skip_special_tokens=True) for r in res)
-        results.append(out)
+        results.append(clean_vietnamese(out))
         
     return "\n\n".join(results)
 
@@ -69,9 +87,3 @@ async def api_translate(req: Request):
     raw_text = data.get("text", "")
     translated = translate_text(raw_text)
     return JSONResponse({"result": translated})
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 10000))
-    print(f"Starting server on port {port}...")
-    uvicorn.run(app, host="0.0.0.0", port=port)
