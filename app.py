@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 import os
 import uvicorn
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI(title="HachimiMT API")
 
@@ -27,11 +29,18 @@ model_path = Path(snapshot_download(repo, allow_patterns=[
 ]))
 
 tokenizer = AutoTokenizer.from_pretrained(str(model_path))
-translator = ctranslate2.Translator(str(model_path / "ct2-int8_float32"), device="cpu", compute_type="int8_float32")
+translator = ctranslate2.Translator(
+    str(model_path / "ct2-int8_float32"), 
+    device="cpu", 
+    compute_type="int8_float32",
+    intra_threads=2,
+    inter_threads=1
+)
 print("Mô hình đã sẵn sàng!")
 
+executor = ThreadPoolExecutor(max_workers=2)
+
 def clean_vietnamese(text: str) -> str:
-    # Thêm khoảng trắng sau dấu câu nếu thiếu
     text = re.sub(r'([.!?])([A-ZÀ-Ỹ0-9])', r'\1 \2', text)
     text = re.sub(r'([,;:])([a-zA-Zà-ỹÀ-Ỹ0-9])', r'\1 \2', text)
     text = re.sub(r' +', ' ', text)
@@ -41,42 +50,31 @@ def translate_text(text: str) -> str:
     if not text or not text.strip():
         return ""
     
-    # Kiểm tra nếu không có tiếng Trung thì không dịch để tránh lỗi mô hình Marian
-    has_chinese = bool(re.search(r'[\u4e00-\u9fa5]', text))
-    if not has_chinese:
+    if not re.search(r'[\u4e00-\u9fa5]', text):
         return text.strip()
 
-    paragraphs = text.split("\n")
-    results = []
+    raw_paragraphs = [p.strip() for p in text.split("\n")]
+    valid_indices = []
+    tokens_batch = []
     
-    for para in paragraphs:
-        para_clean = para.strip()
-        if not para_clean:
-            results.append("")
-            continue
+    for idx, para in enumerate(raw_paragraphs):
+        if para and re.search(r'[\u4e00-\u9fa5]', para):
+            valid_indices.append(idx)
+            tokens_batch.append(tokenizer.convert_ids_to_tokens(tokenizer(para).input_ids))
+            
+    if not tokens_batch:
+        return text.strip()
         
-        # Nếu đoạn không có chữ Hán thì giữ nguyên
-        if not re.search(r'[\u4e00-\u9fa5]', para_clean):
-            results.append(para_clean)
-            continue
+    # Translate entire batch in one single CTranslate2 C++ call!
+    res = translator.translate_batch(tokens_batch, beam_size=1, max_decoding_length=256)
+    
+    translated_paras = list(raw_paragraphs)
+    for i, orig_idx in enumerate(valid_indices):
+        out = tokenizer.decode(tokenizer.convert_tokens_to_ids(res[i].hypotheses[0]), skip_special_tokens=True)
+        translated_paras[orig_idx] = clean_vietnamese(out)
         
-        sentences = [s for s in re.split(r'([。！？\n])', para_clean) if s]
-        chunks = []
-        cur = ""
-        for s in sentences:
-            cur += s
-            if s in ['。', '！', '？', '\n'] or len(cur) > 80:
-                chunks.append(cur)
-                cur = ""
-        if cur:
-            chunks.append(cur)
-        
-        tokens = [tokenizer.convert_ids_to_tokens(tokenizer(c).input_ids) for c in chunks]
-        res = translator.translate_batch(tokens, beam_size=1, max_decoding_length=256)
-        out = "".join(tokenizer.decode(tokenizer.convert_tokens_to_ids(r.hypotheses[0]), skip_special_tokens=True) for r in res)
-        results.append(clean_vietnamese(out))
-        
-    return "\n\n".join(results)
+    # Filter empty and join
+    return "\n\n".join([p for p in translated_paras if p])
 
 @app.get("/")
 def home():
@@ -86,10 +84,14 @@ def home():
 async def api_translate(req: Request):
     data = await req.json()
     raw_text = data.get("text", "")
-    translated = translate_text(raw_text)
+    
+    # Run CPU translation in ThreadPool so asyncio event loop never blocks!
+    loop = asyncio.get_event_loop()
+    translated = await loop.run_in_executor(executor, translate_text, raw_text)
+    
     return JSONResponse({"result": translated})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Khởi động Uvicorn server tại cổng {port}...")
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=port)
