@@ -7,6 +7,7 @@ from huggingface_hub import snapshot_download
 from pathlib import Path
 import re
 import os
+import uvicorn
 
 app = FastAPI(title="HachimiMT API")
 
@@ -87,3 +88,8 @@ async def api_translate(req: Request):
     raw_text = data.get("text", "")
     translated = translate_text(raw_text)
     return JSONResponse({"result": translated})
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    print(f"Khởi động Uvicorn server tại cổng {port}...")
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
