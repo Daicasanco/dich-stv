@@ -3,4 +3,5 @@ uvicorn
 ctranslate2
 transformers
 sentencepiece
+sacremoses
 huggingface_hub
